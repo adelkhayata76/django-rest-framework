@@ -301,20 +301,29 @@ class PKManyRelatedFieldBulkValidationTests(TestCase):
             queryset=ManyToManyTarget.objects.all(),
             pk_field=serializers.BooleanField())
         child.bind('targets', serializers.Serializer())
+        field = serializers.PrimaryKeyRelatedField(
+            queryset=ManyToManyTarget.objects.all(), many=True,
+            pk_field=serializers.BooleanField())
+        field.bind('targets', serializers.Serializer())
         with pytest.raises(serializers.ValidationError) as per_item:
             child.to_internal_value('true')
         with pytest.raises(serializers.ValidationError) as bulk:
-            child.to_internal_value_bulk(['true'])
+            field.to_internal_value(['true'])
         assert bulk.value.detail[0] == per_item.value.detail
         assert 'bool' in str(bulk.value.detail[0])
 
     def test_many_related_field_with_non_related_child(self):
-        # ManyRelatedField may wrap a plain field that has no
-        # `to_internal_value_bulk`; it must fall back to per-item conversion.
+        # Plain ManyRelatedField (not the PK many subclass) still validates
+        # a non-related child with the per-item loop.
         field = serializers.ManyRelatedField(
             child_relation=serializers.IntegerField())
         field.bind('values', serializers.Serializer())
         assert field.to_internal_value([1, 2, 3]) == [1, 2, 3]
+
+    def test_many_true_uses_primary_key_many_related_field(self):
+        field = serializers.PrimaryKeyRelatedField(
+            queryset=ManyToManyTarget.objects.all(), many=True)
+        assert isinstance(field, serializers.PrimaryKeyManyRelatedField)
 
     def test_collects_mixed_errors_in_one_query(self):
         field = self._field()
