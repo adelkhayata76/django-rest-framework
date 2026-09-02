@@ -10,6 +10,7 @@ from django.urls import NoReverseMatch, Resolver404, get_script_prefix, resolve
 from django.utils.encoding import smart_str, uri_to_iri
 from django.utils.translation import gettext_lazy as _
 
+from rest_framework.exceptions import ValidationError
 from rest_framework.fields import (
     Field, SkipField, empty, get_attribute, is_simple_callable, iter_options
 )
@@ -270,18 +271,24 @@ class PrimaryKeyRelatedField(RelatedField):
 
     def to_internal_value_bulk(self, data):
         # Resolve every pk with a single query instead of one `get()` per item.
-        # Per-item error semantics (incorrect_type / does_not_exist), input
-        # ordering, and duplicates are all preserved.
+        # Collect per-item errors (incorrect_type / does_not_exist / pk_field)
+        # keyed by index, matching ListField.run_child_validation. Input
+        # ordering and duplicates are preserved.
         queryset = self.get_queryset()
         model_pk = queryset.model._meta.pk
-        # Each entry is (lookup_key, value): `value` mirrors the per-item path
-        # (post-`pk_field`) and is used for error details, while `lookup_key`
-        # is the pk-typed value used to match `in_bulk()` results.
+        # Each entry is (idx, lookup_key, value): `value` mirrors the per-item
+        # path (post-`pk_field`) and is used for error details, while
+        # `lookup_key` is the pk-typed value used to match `in_bulk()` results.
+        errors = {}
         entries = []
-        for item in data:
-            value = item
-            if self.pk_field is not None:
-                value = self.pk_field.to_internal_value(value)
+        for idx, item in enumerate(data):
+            try:
+                value = item
+                if self.pk_field is not None:
+                    value = self.pk_field.to_internal_value(value)
+            except ValidationError as exc:
+                errors[idx] = exc.detail
+                continue
             try:
                 if isinstance(value, bool):
                     raise TypeError
@@ -290,20 +297,40 @@ class PrimaryKeyRelatedField(RelatedField):
                 # `queryset.get(pk=value)` would have.
                 lookup_key = model_pk.get_prep_value(value)
             except (TypeError, ValueError):
-                self.fail('incorrect_type', data_type=type(value).__name__)
-            entries.append((lookup_key, value))
+                try:
+                    self.fail(
+                        'incorrect_type', data_type=type(value).__name__
+                    )
+                except ValidationError as exc:
+                    errors[idx] = exc.detail
+                continue
+            entries.append((idx, lookup_key, value))
+        lookup_keys = [lookup_key for _, lookup_key, _ in entries]
         try:
-            objects = queryset.in_bulk([lookup_key for lookup_key, _ in entries])
+            objects = queryset.in_bulk(lookup_keys) if lookup_keys else {}
         except (TypeError, ValueError):
             # queryset doesn't support in_bulk (e.g. distinct/sliced); fall
-            # back to the per-item path so behavior is unchanged.
-            return [self.to_internal_value(item) for item in data]
-        result = []
-        for lookup_key, value in entries:
+            # back to a collecting per-item loop so mixed lists still report
+            # every invalid item.
+            errors = {}
+            result = []
+            for idx, item in enumerate(data):
+                try:
+                    result.append(self.to_internal_value(item))
+                except ValidationError as exc:
+                    errors[idx] = exc.detail
+            if errors:
+                raise ValidationError(errors)
+            return result
+        for idx, lookup_key, value in entries:
             if lookup_key not in objects:
-                self.fail('does_not_exist', pk_value=value)
-            result.append(objects[lookup_key])
-        return result
+                try:
+                    self.fail('does_not_exist', pk_value=value)
+                except ValidationError as exc:
+                    errors[idx] = exc.detail
+        if errors:
+            raise ValidationError(errors)
+        return [objects[lookup_key] for _, lookup_key, _ in entries]
 
     def to_representation(self, value):
         if self.pk_field is not None:

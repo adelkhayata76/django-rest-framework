@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 import pytest
 from django.test import TestCase
 
@@ -266,19 +268,23 @@ class PKManyRelatedFieldBulkValidationTests(TestCase):
         missing = max(self.pks) + 1000
         with pytest.raises(serializers.ValidationError) as exc_info:
             field.run_validation([self.pks[0], missing])
-        assert exc_info.value.detail[0].code == 'does_not_exist'
+        detail = exc_info.value.detail
+        assert 0 not in detail
+        assert detail[1][0].code == 'does_not_exist'
 
     def test_incorrect_type_error(self):
         field = self._field()
         with pytest.raises(serializers.ValidationError) as exc_info:
             field.run_validation(['not-a-pk'])
-        assert exc_info.value.detail[0].code == 'incorrect_type'
+        assert exc_info.value.detail[0][0].code == 'incorrect_type'
 
     def test_queryset_filtering_is_respected(self):
         field = self._field(ManyToManyTarget.objects.exclude(pk=self.pks[1]))
         with pytest.raises(serializers.ValidationError) as exc_info:
             field.run_validation([self.pks[0], self.pks[1]])
-        assert exc_info.value.detail[0].code == 'does_not_exist'
+        detail = exc_info.value.detail
+        assert 0 not in detail
+        assert detail[1][0].code == 'does_not_exist'
 
     def test_pk_field_transform_is_applied(self):
         field = serializers.PrimaryKeyRelatedField(
@@ -299,7 +305,7 @@ class PKManyRelatedFieldBulkValidationTests(TestCase):
             child.to_internal_value('true')
         with pytest.raises(serializers.ValidationError) as bulk:
             child.to_internal_value_bulk(['true'])
-        assert str(bulk.value.detail[0]) == str(per_item.value.detail[0])
+        assert bulk.value.detail[0] == per_item.value.detail
         assert 'bool' in str(bulk.value.detail[0])
 
     def test_many_related_field_with_non_related_child(self):
@@ -309,6 +315,53 @@ class PKManyRelatedFieldBulkValidationTests(TestCase):
             child_relation=serializers.IntegerField())
         field.bind('values', serializers.Serializer())
         assert field.to_internal_value([1, 2, 3]) == [1, 2, 3]
+
+    def test_collects_mixed_errors_in_one_query(self):
+        field = self._field()
+        missing = max(self.pks) + 1000
+        with self.assertNumQueries(1):
+            with pytest.raises(serializers.ValidationError) as exc_info:
+                field.run_validation([missing, 'not-a-pk', self.pks[0]])
+        detail = exc_info.value.detail
+        assert detail[0][0].code == 'does_not_exist'
+        assert detail[1][0].code == 'incorrect_type'
+        assert 2 not in detail
+
+    def test_duplicate_invalid_pks_report_each_index(self):
+        field = self._field()
+        missing = max(self.pks) + 1000
+        with pytest.raises(serializers.ValidationError) as exc_info:
+            field.run_validation([missing, self.pks[0], missing])
+        detail = exc_info.value.detail
+        assert detail[0][0].code == 'does_not_exist'
+        assert 1 not in detail
+        assert detail[2][0].code == 'does_not_exist'
+
+    def test_in_bulk_fallback_collects_errors(self):
+        # in_bulk() raises TypeError on sliced querysets; inject that so
+        # the fallback's per-item get() can still resolve valid pks.
+        field = self._field()
+        missing = max(self.pks) + 1000
+        with patch('django.db.models.query.QuerySet.in_bulk',
+                   side_effect=TypeError):
+            with pytest.raises(serializers.ValidationError) as exc_info:
+                field.run_validation([self.pks[0], missing, 'not-a-pk'])
+        detail = exc_info.value.detail
+        assert 0 not in detail
+        assert detail[1][0].code == 'does_not_exist'
+        assert detail[2][0].code == 'incorrect_type'
+
+    def test_pk_field_validation_error_is_collected(self):
+        field = serializers.PrimaryKeyRelatedField(
+            queryset=ManyToManyTarget.objects.all(), many=True,
+            pk_field=serializers.IntegerField())
+        field.bind('targets', serializers.Serializer())
+        with self.assertNumQueries(1):
+            with pytest.raises(serializers.ValidationError) as exc_info:
+                field.run_validation([self.pks[0], 'not-a-number'])
+        detail = exc_info.value.detail
+        assert 0 not in detail
+        assert 1 in detail
 
 
 @pytest.mark.usefixtures("reset_sequences")
